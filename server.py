@@ -639,6 +639,209 @@ def find_views_for_model(model_name: str) -> str:
     return "\n".join(out)
 
 
+@mcp.tool()
+def trace_field_impact(field_name: str, model_name: str) -> str:
+    """
+    Trace which computed fields will be invalidated when a given field changes.
+
+    Traverses DEPENDS_ON edges in reverse — starting from the target field and
+    following all computed fields that depend on it, recursively up to 6 hops.
+
+    Use this BEFORE modifying a field's compute logic or storage — to understand
+    the full downstream impact across the model's computed field graph.
+
+    Also use it to understand why a field is expensive: if many computed fields
+    depend on it, changing it triggers a large recompute cascade.
+
+    Args:
+        field_name:  Technical field name, e.g. 'amount_untaxed'
+        model_name:  Model the field belongs to, e.g. 'account.move'
+    """
+    with _session() as s:
+        # Direct dependants: computed fields whose @api.depends() includes this field
+        direct = _q(s,
+            f"MATCH (computed:`{_FIELD_LABEL}`)-[r:DEPENDS_ON]->(src:`{_FIELD_LABEL}` "
+            f"  {{model: $model, field_name: $field}}) "
+            "RETURN computed.field_name AS name, computed.field_type AS ftype, "
+            "       computed.compute AS compute_fn, r.path AS path, "
+            "       1 AS depth "
+            "ORDER BY computed.field_name",
+            model=model_name, field=field_name)
+
+        # Full cascade: all computed fields reachable in the dependency graph
+        cascade = _q(s,
+            f"MATCH path = (computed:`{_FIELD_LABEL}`)-[:DEPENDS_ON*1..6]->"
+            f"(src:`{_FIELD_LABEL}` {{model: $model, field_name: $field}}) "
+            "WHERE length(path) > 1 "
+            "RETURN DISTINCT computed.field_name AS name, "
+            "       computed.field_type AS ftype, "
+            "       computed.compute AS compute_fn, "
+            "       length(path) AS depth "
+            "ORDER BY depth, computed.field_name",
+            model=model_name, field=field_name)
+
+        # What does the field itself depend on?
+        depends_on = _q(s,
+            f"MATCH (src:`{_FIELD_LABEL}` {{model: $model, field_name: $field}})"
+            f"-[r:DEPENDS_ON]->(dep:`{_FIELD_LABEL}`) "
+            "RETURN dep.field_name AS name, dep.field_type AS ftype, "
+            "       dep.model AS dep_model, r.path AS path "
+            "ORDER BY r.path",
+            model=model_name, field=field_name)
+
+    if not direct and not depends_on:
+        return (
+            f"No dependency edges found for {model_name}.{field_name}.\n"
+            "Either the field has no @api.depends(), nothing depends on it,\n"
+            "or 'Sync Field Dependencies' has not been run yet."
+        )
+
+    out = [
+        f"FIELD IMPACT TRACE: {model_name}.{field_name}",
+        "",
+    ]
+
+    if depends_on:
+        out.append(f"THIS FIELD DEPENDS ON ({len(depends_on)} source(s)):")
+        for d in depends_on:
+            model_tag = f"  [{d.get('dep_model')}]" if d.get("dep_model") != model_name else ""
+            out.append(f"  ← {d.get('path') or d.get('name')}{model_tag}")
+        out.append("")
+
+    if direct:
+        out.append(f"DIRECT DEPENDANTS — invalidated when {field_name} changes ({len(direct)}):")
+        for d in direct:
+            fn = d.get("compute_fn") or ""
+            fn_str = f"  [{fn}]" if fn else ""
+            out.append(f"  → {d.get('name'):<40} {d.get('ftype') or ''}{fn_str}")
+            out.append(f"      via depends path: {d.get('path') or ''}")
+    else:
+        out.append(f"DIRECT DEPENDANTS: none — no computed field declares @api.depends({field_name!r})")
+
+    if cascade:
+        out += ["", f"FULL CASCADE (indirect, up to 6 hops) — {len(cascade)} field(s):"]
+        for c in cascade:
+            indent = "  " + ("  " * (int(c.get("depth", 1)) - 1))
+            fn = c.get("compute_fn") or ""
+            fn_str = f"  [{fn}]" if fn else ""
+            out.append(f"{indent}→ {c.get('name'):<40} {c.get('ftype') or ''}{fn_str}")
+
+    return "\n".join(out)
+
+
+@mcp.tool()
+def get_model_access(model_name: str) -> str:
+    """
+    Return the full security picture for an Odoo model:
+      - Which security groups can read / write / create / delete records
+      - Global (public) access rules with no group restriction
+      - Record rules (ir.rule) with their filter domains and scope
+      - Fields restricted to specific groups (groups= attribute)
+
+    Use this before writing ir.model.access.csv or ir.rule records — to see
+    what already exists and which groups you should reference.
+
+    Also use it when debugging access errors: find exactly which group is
+    missing the permission causing the issue.
+
+    Args:
+        model_name: Technical model name, e.g. 'account.move', 'res.partner'
+    """
+    with _session() as s:
+        # Group-based ACL
+        group_acl = _q(s,
+            f"MATCH (g:SecurityGroup:`{_TENANT}`)-[r:CAN_ACCESS]->"
+            f"(m:OdooModel:`{_TENANT}` {{id: $model}}) "
+            "RETURN g.full_name AS group, g.id AS group_id, "
+            "       r.read AS read, r.write AS write, "
+            "       r.create AS create, r.unlink AS unlink, r.name AS rule_name "
+            "ORDER BY g.full_name",
+            model=model_name)
+
+        # Global access (no group)
+        global_acl = _q(s,
+            f"MATCH (m:OdooModel:`{_TENANT}` {{id: $model}})-[r:GLOBAL_ACCESS]->(m) "
+            "RETURN r.read AS read, r.write AS write, "
+            "       r.create AS create, r.unlink AS unlink, r.name AS rule_name",
+            model=model_name)
+
+        # Record rules
+        record_rules = _q(s,
+            f"MATCH (r:RecordRule:`{_TENANT}`)-[:APPLIES_TO]->"
+            f"(m:OdooModel:`{_TENANT}` {{id: $model}}) "
+            "OPTIONAL MATCH (r)-[:SCOPED_TO]->(g:SecurityGroup:`{_TENANT}`) "
+            "RETURN r.name AS name, r.domain AS domain, "
+            "       r.read AS read, r.write AS write, "
+            "       r.create AS create, r.unlink AS unlink, "
+            "       r.is_global AS is_global, "
+            "       collect(g.full_name) AS groups "
+            "ORDER BY r.is_global DESC, r.name",
+            model=model_name)
+
+        # Field-level group restrictions
+        restricted_fields = _q(s,
+            f"MATCH (f:`{_FIELD_LABEL}` {{model: $model}}) "
+            "WHERE f.field_groups IS NOT NULL AND size(f.field_groups) > 0 "
+            "RETURN f.field_name AS name, f.field_label AS label, "
+            "       f.field_groups AS groups "
+            "ORDER BY f.field_name",
+            model=model_name)
+
+    if not group_acl and not global_acl and not record_rules:
+        return (
+            f"No security data found for model '{model_name}'.\n"
+            "Run 'Sync Security Data' in the Odoo Neo4j config, or check the model name."
+        )
+
+    def perm_str(r):
+        p = []
+        if r.get("read"):   p.append("R")
+        if r.get("write"):  p.append("W")
+        if r.get("create"): p.append("C")
+        if r.get("unlink"): p.append("D")
+        return "/".join(p) if p else "none"
+
+    out = [
+        f"MODEL ACCESS: {model_name}",
+        "",
+    ]
+
+    if global_acl:
+        out.append(f"GLOBAL ACCESS (no group restriction) — {len(global_acl)} rule(s):")
+        for r in global_acl:
+            out.append(f"  {r.get('rule_name') or '(unnamed)'}  perms={perm_str(r)}")
+        out.append("")
+
+    if group_acl:
+        out.append(f"GROUP ACCESS RULES — {len(group_acl)} group(s):")
+        out.append(f"  {'Group':<50} {'Perms':<12} Rule name")
+        out.append("  " + "-" * 80)
+        for r in group_acl:
+            out.append(
+                f"  {(r.get('group') or r.get('group_id') or ''):<50} "
+                f"{perm_str(r):<12} {r.get('rule_name') or ''}"
+            )
+        out.append("")
+
+    if record_rules:
+        out.append(f"RECORD RULES (ir.rule) — {len(record_rules)} rule(s):")
+        for r in record_rules:
+            scope = "GLOBAL" if r.get("is_global") else ", ".join(r.get("groups") or []) or "(no group)"
+            out.append(f"  {r.get('name') or '(unnamed)'}  [{scope}]  perms={perm_str(r)}")
+            domain = (r.get("domain") or "[]").strip()
+            if domain and domain != "[]":
+                out.append(f"    domain: {domain[:120]}")
+        out.append("")
+
+    if restricted_fields:
+        out.append(f"FIELD-LEVEL RESTRICTIONS — {len(restricted_fields)} field(s) have groups=:")
+        for f in restricted_fields:
+            groups = ", ".join(f.get("groups") or [])
+            out.append(f"  {f.get('name'):<40} {f.get('label') or ''}  →  {groups}")
+
+    return "\n".join(out)
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
