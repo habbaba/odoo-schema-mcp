@@ -30,14 +30,8 @@ from contextlib import contextmanager
 from typing import Optional
 
 import requests as _requests
-import uvicorn
 from mcp.server.fastmcp import FastMCP
 from neo4j import GraphDatabase
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.routing import Route
-from starlette.applications import Starlette
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -409,53 +403,10 @@ def find_similar_fields(description: str, model_name: str = "", top_k: int = 10)
     return "\n".join(out)
 
 
-# ── HTTP entry point (SSE transport) ──────────────────────────────────────────
-
-async def _health(request: Request) -> JSONResponse:
-    return JSONResponse({"status": "ok", "tenant": _TENANT})
-
-
-class _BearerAuthMiddleware(BaseHTTPMiddleware):
-    """
-    Simple pre-shared bearer token guard.
-    Skipped entirely when MCP_API_TOKEN is not set (open access).
-    Health endpoint is always public.
-    """
-    async def dispatch(self, request: Request, call_next):
-        if request.url.path == "/health":
-            return await call_next(request)
-        if _API_TOKEN:
-            auth = request.headers.get("Authorization", "")
-            if auth != f"Bearer {_API_TOKEN}":
-                return JSONResponse({"error": "Unauthorized"}, status_code=401)
-        return await call_next(request)
-
-
-def _build_http_app():
-    """
-    Wrap the FastMCP SSE ASGI app with auth middleware and a public /health route.
-    Exposes /sse (GET) and /messages (POST) — compatible with Claude Code type=sse.
-    """
-    mcp_asgi = mcp.sse_app()
-
-    # Inject health route
-    mcp_asgi.routes.insert(0, Route("/health", _health, methods=["GET"]))
-
-    # Add auth middleware
-    from starlette.middleware import Middleware
-    app = Starlette(
-        routes=[Route("/health", _health, methods=["GET"])],
-        middleware=[Middleware(_BearerAuthMiddleware)],
-    )
-    app.mount("/", mcp_asgi)
-    return app
-
-
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     if _TRANSPORT == "sse":
-        app = _build_http_app()
-        uvicorn.run(app, host=_HOST, port=_PORT)
+        mcp.run(transport="sse", host=_HOST, port=_PORT)
     else:
         mcp.run()
