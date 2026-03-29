@@ -22,36 +22,44 @@ A Docker-ready [Model Context Protocol](https://modelcontextprotocol.io) server 
 
 ## Installation
 
-### 1. Clone the repository
+### 1. Clone this repo into the same folder as your `docker-compose.yml`
 
 ```bash
+# On your VPS, go to the folder where your docker-compose.yml lives
+cd /path/to/your/stack
+
+# Clone the MCP server repo as a subfolder
 git clone https://github.com/habbaba/odoo-schema-mcp.git
-cd odoo-schema-mcp
 ```
 
-### 2. Edit `docker-compose.yml`
+Your folder should now look like:
+```
+your-stack/
+├── docker-compose.yml         ← your existing compose file
+└── odoo-schema-mcp/           ← just cloned
+    ├── Dockerfile
+    ├── server.py
+    └── requirements.txt
+```
 
-Open `docker-compose.yml` and replace the placeholder values:
+### 2. Add the `odoo-mcp` service to your `docker-compose.yml`
+
+Copy the `odoo-mcp` service block from the `docker-compose.yml` in this repo and paste it into your existing `docker-compose.yml` under `services:`.
+
+Then replace the three placeholder values:
 
 | Placeholder | What to put |
 |-------------|-------------|
 | `YOUR_NEO4J_HOST` | IP or hostname of your Neo4j server |
 | `YOUR_NEO4J_PASSWORD` | Your Neo4j password |
-| `YOUR_SECRET_TOKEN` | A random secret — generate one with `openssl rand -hex 32` |
-| `webui-net` | The Docker network name of your Open WebUI stack |
+| `YOUR_SECRET_TOKEN` | Run `openssl rand -hex 32` to generate one |
 
-**Find your Open WebUI network name:**
-```bash
-docker network ls
-```
-Look for the network that has `webui` or `open-webui` in its name.
+> If Ollama is already in your stack, `OLLAMA_URL: http://ollama:11434` works as-is — no changes needed.
 
-**If Ollama is not running**, just leave `OLLAMA_URL` as-is — the server will fall back to keyword search automatically.
-
-### 3. Start the container
+### 3. Start the new service
 
 ```bash
-docker compose up -d
+docker compose up -d odoo-mcp
 ```
 
 ### 4. Verify it is running
