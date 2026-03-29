@@ -154,7 +154,7 @@ def search_schema(query: str, top_k: int = 15) -> str:
         results = None
 
         if vector:
-            index_name = f"{_TENANT}FieldVector"
+            index_name = f"{_TENANT}_field_embeddings"
             try:
                 results = _q(s,
                     "CALL db.index.vector.queryNodes($idx, $k, $vec) "
@@ -354,7 +354,7 @@ def find_similar_fields(description: str, model_name: str = "", top_k: int = 10)
         results = None
 
         if vector:
-            index_name = f"{_TENANT}FieldVector"
+            index_name = f"{_TENANT}_field_embeddings"
             try:
                 results = _q(s,
                     "CALL db.index.vector.queryNodes($idx, $k, $vec) "
