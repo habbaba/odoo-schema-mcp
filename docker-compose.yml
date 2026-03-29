@@ -60,7 +60,7 @@ services:
       MCP_API_TOKEN: YOUR_SECRET_TOKEN
 
       # ── Internal — do not change ──────────────────────────────────────────
-      MCP_TRANSPORT: streamable-http
+      MCP_TRANSPORT: sse
       MCP_HOST: 0.0.0.0
       MCP_PORT: "8000"
 

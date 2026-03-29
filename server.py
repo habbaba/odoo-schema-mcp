@@ -409,7 +409,7 @@ def find_similar_fields(description: str, model_name: str = "", top_k: int = 10)
     return "\n".join(out)
 
 
-# ── HTTP entry point (streamable-http transport) ───────────────────────────────
+# ── HTTP entry point (SSE transport) ──────────────────────────────────────────
 
 async def _health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "tenant": _TENANT})
@@ -433,21 +433,20 @@ class _BearerAuthMiddleware(BaseHTTPMiddleware):
 
 def _build_http_app():
     """
-    Wrap the FastMCP streamable-http ASGI app with auth middleware
-    and a public /health route.
+    Wrap the FastMCP SSE ASGI app with auth middleware and a public /health route.
+    Exposes /sse (GET) and /messages (POST) — compatible with Claude Code type=sse.
     """
-    mcp_asgi = mcp.streamable_http_app()
+    mcp_asgi = mcp.sse_app()
 
-    # Inject health route into the MCP app's router
+    # Inject health route
     mcp_asgi.routes.insert(0, Route("/health", _health, methods=["GET"]))
 
-    # Add auth middleware around the whole thing
+    # Add auth middleware
     from starlette.middleware import Middleware
     app = Starlette(
         routes=[Route("/health", _health, methods=["GET"])],
         middleware=[Middleware(_BearerAuthMiddleware)],
     )
-    # Mount the MCP app at root so /mcp endpoint is reachable
     app.mount("/", mcp_asgi)
     return app
 
@@ -455,7 +454,7 @@ def _build_http_app():
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if _TRANSPORT == "streamable-http":
+    if _TRANSPORT == "sse":
         app = _build_http_app()
         uvicorn.run(app, host=_HOST, port=_PORT)
     else:
