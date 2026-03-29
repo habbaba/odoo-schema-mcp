@@ -25,6 +25,7 @@ Configuration (environment variables):
   MCP_PORT        8000                       (default: 8000, HTTP mode only)
   MCP_API_TOKEN   secret-token               (optional — enables bearer auth, HTTP mode only)
 """
+import logging
 import os
 from contextlib import contextmanager
 from typing import Optional
@@ -32,6 +33,8 @@ from typing import Optional
 import requests as _requests
 from mcp.server.fastmcp import FastMCP
 from neo4j import GraphDatabase
+
+_logger = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -71,7 +74,8 @@ def _q(session, cypher: str, **params) -> list[dict]:
 def _embed(text: str) -> Optional[list]:
     """
     Call Ollama to embed text for vector search.
-    Returns None silently if Ollama is unreachable — callers fall back to keyword search.
+    Returns None if Ollama is unreachable or returns an error — callers fall back to keyword search.
+    Logs a warning so failures are visible in Docker logs.
     """
     if not _OLLAMA_URL:
         return None
@@ -82,6 +86,7 @@ def _embed(text: str) -> Optional[list]:
             timeout=15,
         )
         if resp.status_code == 405:
+            # Older Ollama API — fall back to /api/embeddings endpoint
             resp = _requests.post(
                 f"{_OLLAMA_URL}/api/embeddings",
                 json={"model": _EMBED_MODEL, "prompt": text},
@@ -89,10 +94,27 @@ def _embed(text: str) -> Optional[list]:
             )
             resp.raise_for_status()
             return resp.json().get("embedding")
+        if not resp.ok:
+            _logger.warning(
+                "Ollama embedding request failed: HTTP %s — %s. "
+                "Vector search disabled for this request.",
+                resp.status_code, resp.text[:200],
+            )
+            return None
         resp.raise_for_status()
         embeddings = resp.json().get("embeddings", [])
         return embeddings[0] if embeddings else None
-    except Exception:
+    except _requests.exceptions.ConnectionError:
+        _logger.warning(
+            "Ollama unreachable at %s — vector search disabled for this request.",
+            _OLLAMA_URL,
+        )
+        return None
+    except _requests.exceptions.Timeout:
+        _logger.warning("Ollama request timed out — vector search disabled for this request.")
+        return None
+    except Exception as e:
+        _logger.warning("Unexpected error calling Ollama embedding API: %s", e)
         return None
 
 
@@ -165,12 +187,19 @@ def search_schema(query: str, top_k: int = 15) -> str:
                     "ORDER BY score DESC",
                     idx=index_name, k=top_k, vec=vector)
                 search_type = "vector (semantic)"
-            except Exception:
+            except Exception as e:
+                _logger.warning(
+                    "Vector index query failed for index '%s': %s — falling back to keyword search.",
+                    index_name, e,
+                )
                 results = None
 
         if not results:
             results = _keyword_search(s, query, top_k)
-            search_type = "keyword" if not vector else "keyword (vector index not yet created)"
+            if vector:
+                search_type = "keyword (vector index unavailable — check Neo4j index and embeddings)"
+            else:
+                search_type = "keyword (Ollama unavailable — set OLLAMA_URL to enable semantic search)"
 
     if not results:
         return f"No fields found matching '{query}'. Try a shorter or broader query."
@@ -375,12 +404,19 @@ def find_similar_fields(description: str, model_name: str = "", top_k: int = 10)
                     "ORDER BY score DESC",
                     idx=index_name, k=top_k, vec=vector)
                 search_type = "vector (semantic)"
-            except Exception:
+            except Exception as e:
+                _logger.warning(
+                    "Vector index query failed for index '%s': %s — falling back to keyword search.",
+                    index_name, e,
+                )
                 results = None
 
         if not results:
             results = _keyword_search(s, description, top_k)
-            search_type = "keyword" if not vector else "keyword (vector index not yet created)"
+            if vector:
+                search_type = "keyword (vector index unavailable — check Neo4j index and embeddings)"
+            else:
+                search_type = "keyword (Ollama unavailable — set OLLAMA_URL to enable semantic search)"
 
     if not results:
         return f"No similar fields found for: '{description}'"
