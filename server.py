@@ -514,7 +514,7 @@ def _append_field_line(out: list, f: dict):
 
     flag_str = f"  [{', '.join(flags)}]" if flags else ""
     comodel  = f"  → {f['relation']}" if f.get("relation") else ""
-    sel      = f"  ({f['selection_values']})" if f.get("sel") else ""
+    sel      = f"  ({f['sel']})" if f.get("sel") else ""
     mod      = f"  [{f.get('def_mod') or ''}]" if f.get("def_mod") else ""
 
     out.append(f"  {f.get('name', ''):<40} {f.get('label') or ''}{comodel}{sel}{flag_str}{mod}")
