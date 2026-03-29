@@ -403,6 +403,232 @@ def find_similar_fields(description: str, model_name: str = "", top_k: int = 10)
     return "\n".join(out)
 
 
+# ── Blueprint / dependency / view tools ───────────────────────────────────────
+
+def _base_module(modules_str: str) -> str:
+    """
+    Pick the primary defining module from a comma-separated module list.
+    Heuristic: namespace match first, then known namespace map, then shortest.
+    """
+    if not modules_str:
+        return ""
+    modules = [m.strip() for m in modules_str.split(",") if m.strip()]
+    if not modules:
+        return ""
+    if len(modules) == 1:
+        return modules[0]
+    ns_map = {
+        "res": "base", "ir": "base", "mail": "mail",
+        "account": "account", "sale": "sale", "purchase": "purchase",
+        "stock": "stock", "hr": "hr", "project": "project",
+        "crm": "crm", "mrp": "mrp", "product": "product",
+    }
+    first_ns = modules[0].split("_")[0]
+    if first_ns in ns_map and ns_map[first_ns] in modules:
+        return ns_map[first_ns]
+    for m in modules:
+        ns = m.split("_")[0]
+        if ns == m and ns in ns_map:
+            return m
+    return min(modules, key=len)
+
+
+@mcp.tool()
+def get_model_blueprint(model_name: str) -> str:
+    """
+    Return the full field blueprint for an Odoo model — every field with its
+    type, label, required/store/readonly flags, comodel, compute expression,
+    related path, selection values, help text, and defining module.
+
+    Use this BEFORE inheriting a model or adding fields — to see exactly what
+    already exists so you never duplicate a field.
+
+    Also use it to find the correct field names for XML views, Python compute
+    methods, and domain expressions.
+
+    Args:
+        model_name: Technical model name, e.g. 'account.move', 'res.partner'
+    """
+    with _session() as s:
+        meta = _q(s,
+            f"MATCH (m:OdooModel:`{_TENANT}` {{id: $model}}) "
+            "RETURN m._model_name AS label, m._module AS modules",
+            model=model_name)
+
+        fields = _q(s,
+            f"MATCH (f:`{_FIELD_LABEL}` {{model: $model}}) "
+            "RETURN f.field_name AS name, f.field_type AS ftype, "
+            "       f.field_label AS label, f.required AS required, "
+            "       f.store AS store, f.readonly AS readonly, "
+            "       f.compute AS compute, f.related AS related, "
+            "       f.relation AS relation, f.modules AS modules, "
+            "       f.defining_module AS def_mod, "
+            "       f.selection_values AS sel, f.help AS help "
+            "ORDER BY f.field_name",
+            model=model_name)
+
+    if not fields:
+        return (
+            f"Model '{model_name}' not found in the graph.\n"
+            "Check the model name or run 'Sync Schema Only' in Odoo."
+        )
+
+    model_label = meta[0].get("label") or model_name if meta else model_name
+
+    out = [
+        f"MODEL BLUEPRINT: {model_name}",
+        f"Label   : {model_label}",
+        f"Fields  : {len(fields)}",
+        "",
+    ]
+
+    # Group by type for readability
+    TYPE_ORDER = ["many2one", "one2many", "many2many", "selection",
+                  "char", "text", "integer", "float", "monetary",
+                  "boolean", "date", "datetime", "json"]
+    type_groups = {}
+    for f in fields:
+        t = f.get("ftype") or "other"
+        type_groups.setdefault(t, []).append(f)
+    for t in TYPE_ORDER:
+        if t not in type_groups:
+            continue
+        out.append(f"── {t.upper()} ──")
+        for f in type_groups.pop(t):
+            _append_field_line(out, f)
+    for t, fs in type_groups.items():
+        out.append(f"── {t.upper()} ──")
+        for f in fs:
+            _append_field_line(out, f)
+
+    return "\n".join(out)
+
+
+def _append_field_line(out: list, f: dict):
+    flags = []
+    if f.get("required"):  flags.append("required")
+    if f.get("readonly"):  flags.append("readonly")
+    if not f.get("store"): flags.append("NOT stored")
+    if f.get("compute"):   flags.append(f"compute={f['compute']}")
+    if f.get("related"):   flags.append(f"related={f['related']}")
+
+    flag_str = f"  [{', '.join(flags)}]" if flags else ""
+    comodel  = f"  → {f['relation']}" if f.get("relation") else ""
+    sel      = f"  ({f['selection_values']})" if f.get("sel") else ""
+    mod      = f"  [{f.get('def_mod') or ''}]" if f.get("def_mod") else ""
+
+    out.append(f"  {f.get('name', ''):<40} {f.get('label') or ''}{comodel}{sel}{flag_str}{mod}")
+    if f.get("help"):
+        out.append(f"    help: {f['help'][:120]}")
+
+
+@mcp.tool()
+def resolve_model_dependencies(model_names: str) -> str:
+    """
+    Given a comma-separated list of model names, return the `depends` list
+    for your module manifest — the primary module that defines each model.
+
+    Use this EVERY TIME you write a __manifest__.py. Pass all models you
+    are inheriting or referencing and copy the result directly into `depends`.
+
+    Args:
+        model_names: Comma-separated model names,
+                     e.g. 'account.move,res.partner,sale.order'
+    """
+    models = [m.strip() for m in model_names.split(",") if m.strip()]
+    if not models:
+        return "No model names provided."
+
+    with _session() as s:
+        results = _q(s,
+            f"MATCH (m:OdooModel:`{_TENANT}`) "
+            "WHERE m.id IN $models "
+            "RETURN m.id AS model, m._module AS modules",
+            models=models)
+
+    found = {r["model"]: r["modules"] for r in results}
+    not_found = [m for m in models if m not in found]
+
+    depends = []
+    rows = []
+    for model in models:
+        if model not in found:
+            rows.append((model, "", "NOT FOUND"))
+            continue
+        base = _base_module(found[model])
+        rows.append((model, found[model] or "", base))
+        if base and base not in depends:
+            depends.append(base)
+
+    out = [
+        f"RESOLVE MODEL DEPENDENCIES",
+        f"Models requested: {len(models)}",
+        "",
+        f"  {'Model':<35} {'Defining module':<20} {'All modules'}",
+        "  " + "-" * 80,
+    ]
+    for model, all_mods, base in rows:
+        out.append(f"  {model:<35} {base:<20} {all_mods[:60]}")
+
+    out += [
+        "",
+        "COPY INTO __manifest__.py depends:",
+        f"  'depends': {depends},",
+    ]
+
+    if not_found:
+        out += ["", f"WARNING — not found in graph: {not_found}"]
+
+    return "\n".join(out)
+
+
+@mcp.tool()
+def find_views_for_model(model_name: str) -> str:
+    """
+    Return all views defined for a model, grouped by view type.
+
+    Use this before writing a view inheritance to see every existing view
+    for the model — form, list, kanban, search, activity — and their
+    external IDs so you can pick the right inherit_id.
+
+    Args:
+        model_name: Technical model name, e.g. 'account.move'
+    """
+    with _session() as s:
+        views = _q(s,
+            f"MATCH (v:OdooView:`{_TENANT}` {{model: $model}}) "
+            "RETURN v.external_id AS ext_id, v.view_type AS vtype, "
+            "       v.module AS module, v.priority AS priority, "
+            "       v.key AS key "
+            "ORDER BY v.view_type, v.priority",
+            model=model_name)
+
+    if not views:
+        return (
+            f"No views found for model '{model_name}'.\n"
+            "Check the model name or run 'Sync Schema Only' in Odoo."
+        )
+
+    out = [
+        f"VIEWS FOR MODEL: {model_name}",
+        f"Total: {len(views)}",
+        "",
+    ]
+
+    current_type = None
+    for v in views:
+        vtype = v.get("vtype") or "other"
+        if vtype != current_type:
+            out.append(f"── {vtype.upper()} ──")
+            current_type = vtype
+        ext_id = v.get("ext_id") or v.get("key") or "(no id)"
+        module = v.get("module") or ""
+        priority = v.get("priority") or 16
+        out.append(f"  {ext_id:<55} [{module}]  priority={priority}")
+
+    return "\n".join(out)
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
