@@ -48,7 +48,7 @@ _HOST           = os.environ.get("MCP_HOST", "0.0.0.0")
 _PORT           = int(os.environ.get("MCP_PORT", "8000"))
 _API_TOKEN      = os.environ.get("MCP_API_TOKEN", "")
 
-mcp = FastMCP(f"Odoo Graph [{_TENANT}]")
+mcp = FastMCP(f"Odoo Graph [{_TENANT}]", host=_HOST, port=_PORT)
 
 # ── Neo4j helpers ─────────────────────────────────────────────────────────────
 
@@ -406,7 +406,4 @@ def find_similar_fields(description: str, model_name: str = "", top_k: int = 10)
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if _TRANSPORT == "sse":
-        mcp.run(transport="sse", host=_HOST, port=_PORT)
-    else:
-        mcp.run()
+    mcp.run(transport=_TRANSPORT)
