@@ -209,25 +209,34 @@ def find_views_containing_field(field_name: str, model_name: str = "") -> str:
         field_name:  Technical field name, e.g. 'partner_id', 'state', 'amount_total'
         model_name:  Optional — restrict results to one model, e.g. 'account.move'
     """
+    model_filter = "AND v.model = $model " if model_name else ""
+    model_param  = {"field": field_name, "model": model_name} if model_name else {"field": field_name}
+
     with _session() as s:
-        if model_name:
-            views = _q(s,
-                f"MATCH (v:OdooView:`{_TENANT}`) "
-                "WHERE $field IN v.fields_used AND v.model = $model "
-                "RETURN v.external_id AS ext_id, v.key AS key, "
-                "       v.view_type AS vtype, v.model AS model, "
-                "       v.module AS module, v.priority AS priority "
-                "ORDER BY v.model, v.view_type, v.priority",
-                field=field_name, model=model_name)
-        else:
-            views = _q(s,
-                f"MATCH (v:OdooView:`{_TENANT}`) "
-                "WHERE $field IN v.fields_used "
-                "RETURN v.external_id AS ext_id, v.key AS key, "
-                "       v.view_type AS vtype, v.model AS model, "
-                "       v.module AS module, v.priority AS priority "
-                "ORDER BY v.model, v.view_type, v.priority",
-                field=field_name)
+        # Native: field appears in the view's own arch
+        native = _q(s,
+            f"MATCH (v:OdooView:`{_TENANT}`) "
+            f"WHERE $field IN v.fields_used {model_filter}"
+            "RETURN v.external_id AS ext_id, v.key AS key, "
+            "       v.view_type AS vtype, v.model AS model, "
+            "       v.module AS module, v.priority AS priority, "
+            "       'native' AS source "
+            "ORDER BY v.model, v.view_type, v.priority",
+            **model_param)
+
+        # Inherited: field is injected into this view by an extension view
+        inherited = _q(s,
+            f"MATCH (v:OdooView:`{_TENANT}`) "
+            f"WHERE $field IN coalesce(v.fields_used_inherited, []) {model_filter}"
+            "  AND NOT ($field IN coalesce(v.fields_used, [])) "
+            "RETURN v.external_id AS ext_id, v.key AS key, "
+            "       v.view_type AS vtype, v.model AS model, "
+            "       v.module AS module, v.priority AS priority, "
+            "       'inherited' AS source "
+            "ORDER BY v.model, v.view_type, v.priority",
+            **model_param)
+
+    views = native + inherited
 
     if not views:
         scope = f" on model '{model_name}'" if model_name else ""
@@ -239,7 +248,7 @@ def find_views_containing_field(field_name: str, model_name: str = "") -> str:
     out = [
         f"VIEWS CONTAINING FIELD: '{field_name}'"
         + (f" (model: {model_name})" if model_name else ""),
-        f"Found in {len(views)} view(s)",
+        f"Found in {len(views)} view(s)  ({len(native)} native, {len(inherited)} via inheritance)",
         "",
     ]
 
@@ -249,10 +258,11 @@ def find_views_containing_field(field_name: str, model_name: str = "") -> str:
         if m != current_model:
             out.append(f"  [{m}]")
             current_model = m
-        ext = v.get("ext_id") or v.get("key") or "(no external_id)"
-        vtype = v.get("vtype") or ""
+        ext    = v.get("ext_id") or v.get("key") or "(no external_id)"
+        vtype  = v.get("vtype") or ""
         module = v.get("module") or ""
-        out.append(f"    {ext:<55} {vtype:<10} {module}")
+        tag    = " [inherited]" if v.get("source") == "inherited" else ""
+        out.append(f"    {ext:<55} {vtype:<10} {module}{tag}")
 
     return "\n".join(out)
 
