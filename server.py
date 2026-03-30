@@ -6,11 +6,18 @@ Supports two transports:
   stdio           — local use (Claude Code .mcp.json with command/args)
   streamable-http — Docker/network use (Open WebUI, remote Claude Code)
 
-Tools expose capabilities the live Odoo MCP CANNOT provide:
+Tools (11 total):
   search_schema               — semantic / keyword search over field descriptions
-  find_views_containing_field — which views already display a given field
-  get_view_inheritance_chain  — full EXTENDS_VIEW parent chain for a view
   find_similar_fields         — fields semantically similar to a description
+  get_model_blueprint         — full field listing for a model
+  resolve_model_dependencies  — model names → module names for manifest depends
+  find_views_for_model        — all views registered for a model
+  find_views_containing_field — every view that references a specific field
+  get_view_inheritance_chain  — full EXTENDS_VIEW parent/child chain for a view
+  trace_field_impact          — computed fields invalidated when a field changes
+  get_model_access            — full ACL picture for a model
+  get_tenant_info             — Odoo version + installed modules for this tenant
+  get_model_methods           — compute/onchange/button/constrains methods for a model
 
 Configuration (environment variables):
   NEO4J_URI       bolt://host:7687           (required)
@@ -874,6 +881,158 @@ def get_model_access(model_name: str) -> str:
         for f in restricted_fields:
             groups = ", ".join(f.get("groups") or [])
             out.append(f"  {f.get('name'):<40} {f.get('label') or ''}  →  {groups}")
+
+    return "\n".join(out)
+
+
+# ── Tool 10: get_tenant_info ──────────────────────────────────────────────────
+
+@mcp.tool()
+def get_tenant_info() -> str:
+    """
+    Return the Odoo version and full list of installed modules for this tenant.
+
+    Use this at the START of any development session to:
+      - Confirm which Odoo version syntax rules apply (18.0 vs 17.0 etc.)
+      - Validate module names before adding them to `depends` in __manifest__.py
+      - Understand what is available on this specific client instance
+
+    Returns Odoo version string and the complete list of installed module names.
+    """
+    with _session() as session:
+        row = _q(
+            session,
+            "MATCH (t:OdooTenant {label: $tenant}) RETURN t",
+            tenant=_TENANT,
+        )
+
+    if not row:
+        return (
+            f"No OdooTenant node found for tenant '{_TENANT}'.\n"
+            "Run 'Full Sync Now' in the Odoo Neo4j config to populate it."
+        )
+
+    node = row[0].get("t", {})
+    version = node.get("odoo_version") or "unknown"
+    modules = node.get("installed_modules") or []
+    last_sync = node.get("last_sync") or "unknown"
+
+    # Determine syntax rules from version
+    major = version.split(".")[0] if version != "unknown" else ""
+    if major in ("18", "17"):
+        syntax = (
+            "Use <list> not <tree>. "
+            "No attrs=. No states=. No name_get(). "
+            "Use fields.Command not tuples. "
+            "Use _compute_display_name() not name_get()."
+        )
+    elif major == "16":
+        syntax = (
+            "Use <list> not <tree>. "
+            "No attrs=. No states=. No name_get(). "
+            "Use fields.Command not tuples."
+        )
+    elif major in ("15", "14", "13"):
+        syntax = (
+            "Use <tree>. attrs= and states= are valid. "
+            "name_get() is valid. Old-style x2many tuples are valid."
+        )
+    else:
+        syntax = "Version unknown — do not generate code until version is confirmed."
+
+    out = [
+        f"TENANT: {_TENANT}",
+        f"ODOO VERSION: {version}",
+        f"LAST SYNC: {last_sync}",
+        f"VERSION SYNTAX RULES: {syntax}",
+        "",
+        f"INSTALLED MODULES ({len(modules)} total):",
+    ]
+
+    # Group alphabetically in rows of 6 for readability
+    sorted_mods = sorted(modules)
+    for i in range(0, len(sorted_mods), 6):
+        out.append("  " + "  ".join(sorted_mods[i:i + 6]))
+
+    return "\n".join(out)
+
+
+# ── Tool 11: get_model_methods ────────────────────────────────────────────────
+
+@mcp.tool()
+def get_model_methods(model_name: str) -> str:
+    """
+    Return all ORM methods indexed for a model — compute, onchange, constrains,
+    and button (action) methods.
+
+    Use this to:
+      - Understand what business logic is attached to a model before modifying it
+      - Find which method computes a specific field (target_field column)
+      - Identify all onchange triggers before adding a new one
+      - Audit button methods before overriding them in a custom module
+      - Understand the full behaviour chain: user action → button → compute → onchange
+
+    Args:
+        model_name: Technical model name, e.g. 'account.move', 'sale.order'
+    """
+    with _session() as session:
+        rows = _q(
+            session,
+            f"""
+            MATCH (mdl:OdooModel:`{_TENANT}` {{id: $model}})
+                  -[:HAS_METHOD]->
+                  (mth:OdooMethod:`{_TENANT}`)
+            RETURN
+                mth.name         AS name,
+                mth.type         AS type,
+                mth.target_field AS target_field,
+                mth.model        AS model
+            ORDER BY mth.type, mth.name
+            """,
+            model=model_name,
+        )
+
+    if not rows:
+        return (
+            f"No methods found for model '{model_name}'.\n"
+            "Either the model does not exist, or run 'Full Sync Now' "
+            "in the Odoo Neo4j config to index ORM methods."
+        )
+
+    by_type = {}
+    for r in rows:
+        t = r.get("type") or "other"
+        by_type.setdefault(t, []).append(r)
+
+    total = len(rows)
+    out = [
+        f"ORM METHODS: {model_name}",
+        f"Total: {total}",
+        "",
+    ]
+
+    type_order = ["button", "compute", "onchange", "constrains", "other"]
+    type_labels = {
+        "button":     "BUTTON / ACTION METHODS",
+        "compute":    "COMPUTE METHODS",
+        "onchange":   "ONCHANGE METHODS",
+        "constrains": "CONSTRAINT METHODS",
+        "other":      "OTHER METHODS",
+    }
+
+    for mtype in type_order:
+        methods = by_type.get(mtype)
+        if not methods:
+            continue
+        out.append(f"── {type_labels.get(mtype, mtype.upper())} ({len(methods)}) ──")
+        for m in methods:
+            name = m.get("name") or "?"
+            target = m.get("target_field") or ""
+            if target:
+                out.append(f"  {name}  → computes: {target}")
+            else:
+                out.append(f"  {name}")
+        out.append("")
 
     return "\n".join(out)
 
